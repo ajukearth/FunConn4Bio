@@ -294,6 +294,33 @@ dataImport <- function(id, parent_session = NULL) {
       Freezing = c(25.3, 42.1, 23.8, 38.7, 27.2, 40.5, 24.6, 39.3)
     )
     
+    # Function to load data safely
+    load_data <- function(file_path, sheet_name = NULL) {
+      file_ext <- tools::file_ext(file_path)
+      
+      if (file_ext == "csv") {
+        tryCatch({
+          data <- readr::read_csv(file_path)
+          return(as.data.frame(data))
+        }, error = function(e) {
+          stop(paste("Error loading CSV file:", e$message))
+        })
+      } else if (file_ext %in% c("xlsx", "xls")) {
+        tryCatch({
+          if (!is.null(sheet_name)) {
+            data <- openxlsx::read.xlsx(file_path, sheet = sheet_name)
+          } else {
+            data <- openxlsx::read.xlsx(file_path)
+          }
+          return(data)
+        }, error = function(e) {
+          stop(paste("Error loading Excel file:", e$message))
+        })
+      } else {
+        stop("Unsupported file format. Please upload a CSV or Excel file.")
+      }
+    }
+    
     # Handle file upload
     shiny::observeEvent(input$file, {
       req(input$file)
@@ -390,6 +417,190 @@ dataImport <- function(id, parent_session = NULL) {
       return(!is.null(rv$raw_data))
     })
     shiny::outputOptions(output, "data_available", suspendWhenHidden = FALSE)
+    
+    # Function to validate data structure
+    validate_data <- function(data, required_columns = NULL, id_column = NULL, group_columns = NULL) {
+      results <- list(
+        valid = TRUE,
+        messages = character(0)
+      )
+      
+      # Check if data exists and is a data frame
+      if (is.null(data) || !is.data.frame(data)) {
+        results$valid <- FALSE
+        results$messages <- c(results$messages, "Data is not a valid data frame.")
+        return(results)
+      }
+      
+      # Check minimum number of rows
+      if (nrow(data) < 5) {
+        results$valid <- FALSE
+        results$messages <- c(results$messages, 
+                              "Data has fewer than 5 rows. More data is needed for robust analysis.")
+      }
+      
+      # Check for required columns
+      if (!is.null(required_columns)) {
+        missing_cols <- required_columns[!required_columns %in% names(data)]
+        if (length(missing_cols) > 0) {
+          results$valid <- FALSE
+          results$messages <- c(results$messages, 
+                                paste("Missing required columns:", 
+                                      paste(missing_cols, collapse = ", ")))
+        }
+      }
+      
+      # Check ID column
+      if (!is.null(id_column) && id_column %in% names(data)) {
+        # Check for duplicate IDs
+        if (any(duplicated(data[[id_column]]))) {
+          results$valid <- FALSE
+          results$messages <- c(results$messages, 
+                                paste("Duplicate values found in ID column:", id_column))
+        }
+      }
+      
+      # Check group columns
+      if (!is.null(group_columns)) {
+        present_group_cols <- group_columns[group_columns %in% names(data)]
+        for (col in present_group_cols) {
+          # Check if there's at least two groups in each grouping variable
+          if (length(unique(na.omit(data[[col]]))) < 2) {
+            results$messages <- c(results$messages, 
+                                  paste("Warning: Group column", col, 
+                                        "has fewer than 2 groups. This may not be useful for comparison."))
+          }
+        }
+      }
+      
+      # Check if there are numeric columns for analysis
+      numeric_cols <- names(data)[sapply(data, is.numeric)]
+      if (length(numeric_cols) < 3) {
+        results$valid <- FALSE
+        results$messages <- c(results$messages, 
+                              "Insufficient numeric columns for network analysis. Need at least 3.")
+      }
+      
+      return(results)
+    }
+    
+    # Function to impute missing values with column means
+    impute_with_mean <- function(data, columns = NULL) {
+      if (is.null(columns)) {
+        columns <- names(data)[sapply(data, is.numeric)]
+      }
+      
+      # Create a copy of the data
+      imputed_data <- data
+      
+      # Impute each column with its mean
+      for (col in columns) {
+        if (any(is.na(imputed_data[[col]]))) {
+          col_mean <- mean(imputed_data[[col]], na.rm = TRUE)
+          imputed_data[is.na(imputed_data[[col]]), col] <- col_mean
+        }
+      }
+      
+      return(imputed_data)
+    }
+    
+    # Basic placeholder function for data quality assessment
+    analyze_data_quality <- function(data, region_columns, group_columns = NULL) {
+      # Initialize quality metrics
+      quality_metrics <- list(
+        sample_size = nrow(data),
+        missing_values = sum(is.na(data[, region_columns, drop = FALSE])),
+        missing_percent = sum(is.na(data[, region_columns, drop = FALSE])) / 
+          (nrow(data) * length(region_columns)) * 100,
+        outliers_count = 0,  # Will be populated later
+        normality_tests = list(),
+        group_balance = NULL,
+        recommended_threshold = 0.3,
+        recommended_method = "standard",
+        recommendations = list(),
+        warnings = character()
+      )
+      
+      # Calculate group balance if group columns provided
+      if (!is.null(group_columns) && length(group_columns) > 0 && "Group" %in% names(data)) {
+        group_counts <- table(data$Group)
+        quality_metrics$group_balance <- list(
+          Group = list(
+            counts = as.list(group_counts),
+            min_size = min(group_counts),
+            max_size = max(group_counts),
+            balance_ratio = min(group_counts) / max(group_counts)
+          )
+        )
+        
+        # Use minimum group size for some calculations
+        quality_metrics$min_group_size <- min(group_counts)
+      }
+      
+      # Simple outlier detection
+      outlier_counts <- numeric(length(region_columns))
+      names(outlier_counts) <- region_columns
+      
+      for (i in seq_along(region_columns)) {
+        col <- region_columns[i]
+        x <- data[[col]]
+        x <- x[!is.na(x)]
+        
+        if (length(x) > 3) {
+          # Simple IQR method
+          q1 <- quantile(x, 0.25)
+          q3 <- quantile(x, 0.75)
+          iqr <- q3 - q1
+          lower_bound <- q1 - 1.5 * iqr
+          upper_bound <- q3 + 1.5 * iqr
+          outliers <- x[x < lower_bound | x > upper_bound]
+          outlier_counts[i] <- length(outliers)
+        }
+      }
+      
+      quality_metrics$outliers_count <- sum(outlier_counts)
+      quality_metrics$outliers_by_region <- outlier_counts
+      
+      # Generate basic recommendations
+      n <- quality_metrics$sample_size
+      n_regions <- length(region_columns)
+      
+      if (n < 10) {
+        quality_metrics$recommended_threshold <- 0.5
+        quality_metrics$recommendations$sample_size <- "Sample size is small. Use higher correlation threshold (0.5) and consider standard correlation methods."
+      } else if (n < 20) {
+        quality_metrics$recommended_threshold <- 0.4
+        quality_metrics$recommendations$sample_size <- "Moderate sample size. Use standard correlation with threshold around 0.4."
+      } else {
+        quality_metrics$recommended_threshold <- 0.3
+        quality_metrics$recommendations$sample_size <- "Good sample size. Can use lower correlation threshold (0.3) for more connections."
+      }
+      
+      # Missing data recommendations
+      if (quality_metrics$missing_percent > 5) {
+        quality_metrics$recommendations$missing_data <- "Significant missing data detected. Consider imputation."
+      }
+      
+      # Statistical power calculation (simplified)
+      r_values <- c(0.3, 0.5, 0.7)  # Small, medium, large effect sizes
+      power_values <- numeric(length(r_values))
+      
+      for (i in seq_along(r_values)) {
+        r <- r_values[i]
+        z_r <- 0.5 * log((1 + r) / (1 - r))  # Fisher's z transformation
+        se <- 1 / sqrt(n - 3)
+        z_critical <- qnorm(0.975)  # Two-tailed test at α = 0.05
+        power_values[i] <- 1 - pnorm(z_critical - abs(z_r) / se) + pnorm(-z_critical - abs(z_r) / se)
+      }
+      
+      quality_metrics$statistical_power <- list(
+        r_0.3 = power_values[1],
+        r_0.5 = power_values[2],
+        r_0.7 = power_values[3]
+      )
+      
+      return(quality_metrics)
+    }
     
     # Configure data with enhanced quality assessment
     shiny::observeEvent(input$configure_data, {
@@ -579,13 +790,9 @@ dataImport <- function(id, parent_session = NULL) {
       if (outlier_percent > 10) score <- score - 15
       else if (outlier_percent > 5) score <- score - 8
       
-      # Penalize for highly non-normal data
-      if (length(metrics$normality_tests) > 0) {
-        non_normal_count <- sum(sapply(metrics$normality_tests, function(x) !x$consensus_normal))
-        non_normal_percent <- non_normal_count / length(metrics$normality_tests) * 100
-        if (non_normal_percent > 70) score <- score - 15
-        else if (non_normal_percent > 40) score <- score - 8
-      }
+      # Penalize for low statistical power
+      if (metrics$statistical_power$r_0.3 < 0.4) score <- score - 15
+      else if (metrics$statistical_power$r_0.3 < 0.8) score <- score - 8
       
       # Ensure score is between 0 and 100
       score <- max(0, min(100, score))
@@ -685,89 +892,35 @@ dataImport <- function(id, parent_session = NULL) {
     
     # Distribution analysis UI
     output$distribution_analysis_ui <- shiny::renderUI({
-      req(rv$data_quality_metrics$normality_tests)
+      req(rv$data_quality_metrics)
       
-      normality_tests <- rv$data_quality_metrics$normality_tests
-      
-      if (length(normality_tests) == 0) {
-        return(shiny::p("No normality tests available."))
+      # Basic placeholder since we don't have detailed normality tests
+      if (is.null(rv$data_quality_metrics$normality_tests)) {
+        return(shiny::p("Normality assessment not available in this simplified version."))
       }
       
-      # Create summary table
-      normality_summary <- data.frame(
-        Region = names(normality_tests),
-        Normal = sapply(normality_tests, function(x) x$consensus_normal),
-        Confidence = sapply(normality_tests, function(x) round(x$normality_confidence, 2)),
-        Skewness = sapply(normality_tests, function(x) round(x$moments$skewness, 2)),
-        Kurtosis = sapply(normality_tests, function(x) round(x$moments$kurtosis, 2)),
-        stringsAsFactors = FALSE
-      )
-      
-      # Count normal vs non-normal
-      normal_count <- sum(normality_summary$Normal)
-      total_count <- nrow(normality_summary)
-      normal_percent <- round((normal_count / total_count) * 100, 1)
-      
-      shiny::tagList(
-        shiny::div(
-          class = if (normal_percent >= 70) "alert alert-success" else if (normal_percent >= 50) "alert alert-warning" else "alert alert-danger",
-          shiny::h5("Distribution Summary"),
-          shiny::p(paste0(normal_count, " out of ", total_count, " regions (", normal_percent, "%) show normal distributions"))
-        ),
-        
-        DT::DTOutput(session$ns("normality_table"))
-      )
-    })
-    
-    # Render normality table
-    output$normality_table <- DT::renderDT({
-      req(rv$data_quality_metrics$normality_tests)
-      
-      normality_tests <- rv$data_quality_metrics$normality_tests
-      
-      normality_summary <- data.frame(
-        Region = names(normality_tests),
-        Normal = sapply(normality_tests, function(x) ifelse(x$consensus_normal, "✓", "✗")),
-        Confidence = sapply(normality_tests, function(x) round(x$normality_confidence, 2)),
-        Skewness = sapply(normality_tests, function(x) round(x$moments$skewness, 2)),
-        Kurtosis = sapply(normality_tests, function(x) round(x$moments$kurtosis, 2)),
-        stringsAsFactors = FALSE
-      )
-      
-      DT::datatable(
-        normality_summary,
-        options = list(
-          pageLength = 15,
-          scrollY = "400px",
-          paging = FALSE
-        ),
-        rownames = FALSE
-      ) %>%
-        DT::formatStyle(
-          "Normal",
-          backgroundColor = DT::styleEqual(c("✓", "✗"), c("#d4edda", "#f8d7da"))
-        )
+      return(shiny::p("Distribution analysis would be shown here in the full version."))
     })
     
     # Outlier analysis UI
     output$outlier_analysis_ui <- shiny::renderUI({
-      req(rv$data_quality_metrics$outlier_details)
+      req(rv$data_quality_metrics)
       
-      outlier_details <- rv$data_quality_metrics$outlier_details
+      metrics <- rv$data_quality_metrics
       
-      # Create outlier summary
-      outlier_summary <- data.frame(
-        Region = names(outlier_details),
-        IQR_Outliers = sapply(outlier_details, function(x) x$iqr_outliers),
-        Z_Score_Outliers = sapply(outlier_details, function(x) x$z_outliers),
-        MAD_Outliers = sapply(outlier_details, function(x) x$mad_outliers),
-        Total_Outliers = sapply(outlier_details, function(x) x$total_unique_outliers),
-        Percentage = sapply(outlier_details, function(x) round(x$outlier_percentage, 1)),
+      if (is.null(metrics$outliers_by_region)) {
+        return(shiny::p("Detailed outlier analysis not available."))
+      }
+      
+      # Create a simple table of outliers by region
+      outlier_df <- data.frame(
+        Region = names(metrics$outliers_by_region),
+        Outliers = as.numeric(metrics$outliers_by_region),
         stringsAsFactors = FALSE
       )
       
-      total_outliers <- sum(outlier_summary$Total_Outliers)
-      total_points <- rv$data_quality_metrics$sample_size * length(rv$column_info$region_columns)
+      total_outliers <- sum(outlier_df$Outliers)
+      total_points <- metrics$sample_size * length(rv$column_info$region_columns)
       outlier_percent <- round((total_outliers / total_points) * 100, 1)
       
       shiny::tagList(
@@ -777,39 +930,18 @@ dataImport <- function(id, parent_session = NULL) {
           shiny::p(paste0("Total outliers detected: ", total_outliers, " (", outlier_percent, "% of all data points)"))
         ),
         
-        DT::DTOutput(session$ns("outlier_table"))
+        DT::renderDT({
+          DT::datatable(
+            outlier_df,
+            options = list(
+              pageLength = 15,
+              scrollY = "400px",
+              paging = FALSE
+            ),
+            rownames = FALSE
+          )
+        })
       )
-    })
-    
-    # Render outlier table
-    output$outlier_table <- DT::renderDT({
-      req(rv$data_quality_metrics$outlier_details)
-      
-      outlier_details <- rv$data_quality_metrics$outlier_details
-      
-      outlier_summary <- data.frame(
-        Region = names(outlier_details),
-        IQR_Outliers = sapply(outlier_details, function(x) x$iqr_outliers),
-        Z_Score_Outliers = sapply(outlier_details, function(x) x$z_outliers),
-        MAD_Outliers = sapply(outlier_details, function(x) x$mad_outliers),
-        Total_Outliers = sapply(outlier_details, function(x) x$total_unique_outliers),
-        Percentage = sapply(outlier_details, function(x) paste0(round(x$outlier_percentage, 1), "%")),
-        stringsAsFactors = FALSE
-      )
-      
-      DT::datatable(
-        outlier_summary,
-        options = list(
-          pageLength = 15,
-          scrollY = "400px",
-          paging = FALSE
-        ),
-        rownames = FALSE
-      ) %>%
-        DT::formatStyle(
-          "Percentage",
-          backgroundColor = DT::styleInterval(c(2, 5, 10), c("#d4edda", "#fff3cd", "#f8d7da", "#f5c6cb"))
-        )
     })
     
     # Statistical power analysis UI
@@ -834,6 +966,8 @@ dataImport <- function(id, parent_session = NULL) {
         stringsAsFactors = FALSE
       )
       
+      power_data$Status <- ifelse(power_data$Adequate, "✓", "✗")
+      
       shiny::tagList(
         shiny::div(
           class = "alert alert-info",
@@ -842,48 +976,19 @@ dataImport <- function(id, parent_session = NULL) {
           shiny::p(shiny::em("Power ≥ 0.80 is generally considered adequate"))
         ),
         
-        DT::DTOutput(session$ns("power_table"))
+        DT::renderDT({
+          DT::datatable(
+            power_data[, c("Effect_Size", "Power", "Status")],
+            options = list(
+              pageLength = 5,
+              paging = FALSE,
+              searching = FALSE,
+              dom = 't'
+            ),
+            rownames = FALSE
+          )
+        })
       )
-    })
-    
-    # Render power table
-    output$power_table <- DT::renderDT({
-      req(rv$data_quality_metrics$statistical_power)
-      
-      power_analysis <- rv$data_quality_metrics$statistical_power
-      
-      power_data <- data.frame(
-        Effect_Size = c("Small (r = 0.3)", "Medium (r = 0.5)", "Large (r = 0.7)"),
-        Power = c(
-          round(power_analysis$r_0.3, 3),
-          round(power_analysis$r_0.5, 3),
-          round(power_analysis$r_0.7, 3)
-        ),
-        Adequate = c(
-          ifelse(power_analysis$r_0.3 >= 0.8, "✓", "✗"),
-          ifelse(power_analysis$r_0.5 >= 0.8, "✓", "✗"),
-          ifelse(power_analysis$r_0.7 >= 0.8, "✓", "✗")
-        ),
-        stringsAsFactors = FALSE
-      )
-      
-      DT::datatable(
-        power_data,
-        options = list(
-          pageLength = 5,
-          paging = FALSE,
-          searching = FALSE
-        ),
-        rownames = FALSE
-      ) %>%
-        DT::formatStyle(
-          "Adequate",
-          backgroundColor = DT::styleEqual(c("✓", "✗"), c("#d4edda", "#f8d7da"))
-        ) %>%
-        DT::formatStyle(
-          "Power",
-          backgroundColor = DT::styleInterval(c(0.6, 0.8), c("#f8d7da", "#fff3cd", "#d4edda"))
-        )
     })
     
     # Group balance analysis UI
@@ -892,13 +997,17 @@ dataImport <- function(id, parent_session = NULL) {
       
       group_balance <- rv$data_quality_metrics$group_balance
       
+      if (length(group_balance) == 0) {
+        return(shiny::p("Group balance information not available."))
+      }
+      
       ui_elements <- list()
       
       for (group_name in names(group_balance)) {
         balance_info <- group_balance[[group_name]]
         
         # Create balance summary
-        balance_summary <- data.frame(
+        balance_data <- data.frame(
           Group = names(balance_info$counts),
           Count = as.numeric(balance_info$counts),
           stringsAsFactors = FALSE
@@ -922,22 +1031,20 @@ dataImport <- function(id, parent_session = NULL) {
             shiny::p(paste0("Balance Quality: ", balance_quality, " (Ratio: ", round(balance_info$balance_ratio, 2), ")")),
             shiny::p(paste0("Size range: ", balance_info$min_size, " - ", balance_info$max_size, " subjects per group"))
           ),
-          DT::DTOutput(session$ns(paste0("balance_table_", gsub("[^a-zA-Z0-9]", "_", group_name)))),
+          DT::renderDT({
+            DT::datatable(
+              balance_data,
+              options = list(
+                pageLength = 10,
+                paging = FALSE,
+                searching = FALSE,
+                dom = 't'
+              ),
+              rownames = FALSE
+            )
+          }),
           shiny::br()
         )
-        
-        # Create the table output
-        output[[paste0("balance_table_", gsub("[^a-zA-Z0-9]", "_", group_name))]] <- DT::renderDT({
-          DT::datatable(
-            balance_summary,
-            options = list(
-              pageLength = 10,
-              paging = FALSE,
-              searching = FALSE
-            ),
-            rownames = FALSE
-          )
-        })
       }
       
       do.call(shiny::tagList, ui_elements)
