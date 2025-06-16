@@ -17,15 +17,13 @@ library(readr)
 library(openxlsx)
 library(colourpicker)
 library(RColorBrewer)
-library(mice)
-library(naniar)
-library(ggraph)
+library(zip)  # Make sure this is installed
 
-# Source utility functions and modules
+# Source fixed module files
+source("module_import.R")  
+source("module_preferences.R")   
+source("module_results.R") 
 source("utils.R")
-source("module_import.R")
-source("module_preferences.R")
-source("module_results.R")
 
 # Define UI
 ui <- shinydashboard::dashboardPage(
@@ -58,7 +56,7 @@ ui <- shinydashboard::dashboardPage(
     shiny::div(
       style = "padding: 15px;",
       shiny::p("Brain Network Analysis App", style = "font-weight: bold;"),
-      shiny::p("Version 1.2.0"),
+      shiny::p("Version 1.2.1 (Fixed)"),
       shiny::p("© 2025", style = "font-size: 90%;"),
       shiny::p("Enhanced with smart parameter recommendations", style = "font-size: 85%; font-style: italic;")
     )
@@ -67,12 +65,6 @@ ui <- shinydashboard::dashboardPage(
   shinydashboard::dashboardBody(
     # Use shinyjs
     shinyjs::useShinyjs(),
-    
-    # Include the help panels JavaScript
-    tags$head(
-      tags$script(src = "help-panels.js"),
-      tags$link(rel = "stylesheet", type = "message", href = "help-panels.css")
-    ),
     
     # Custom CSS with scrolling fixes and enhanced styling
     tags$head(
@@ -227,6 +219,51 @@ ui <- shinydashboard::dashboardPage(
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
           }
+          
+          /* Help panel styling */
+          .help-panel {
+            margin-top: 5px;
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            background-color: #f8f9fa;
+            border-left: 4px solid #6c757d;
+            border-radius: 3px;
+            font-size: 0.9em;
+          }
+          
+          .help-title {
+            font-weight: bold;
+            color: #495057;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+          }
+          
+          .help-icon {
+            color: #6c757d;
+            margin-right: 5px;
+          }
+          
+          .help-content {
+            margin-top: 8px;
+            display: none;
+          }
+          
+          .help-panel.active .help-content {
+            display: block;
+          }
+        ")
+      ),
+      
+      # Simple help panel toggle JavaScript
+      tags$script(
+        HTML("
+          $(document).ready(function() {
+            $(document).on('click', '.help-title', function() {
+              $(this).parent().toggleClass('active');
+            });
+          });
         ")
       )
     ),
@@ -271,13 +308,22 @@ server <- function(input, output, session) {
   # Update workflow status based on module results
   observe({
     # Update status flags
-    new_import_status <- !is.null(data_import_results()) && 
-      !is.null(data_import_results()$data_configured) && 
-      data_import_results()$data_configured
+    new_import_status <- FALSE
+    new_preferences_status <- FALSE
     
-    new_preferences_status <- !is.null(preferences_results()) && 
-      !is.null(preferences_results()$configuration_saved) && 
-      preferences_results()$configuration_saved
+    # Safely check data import status
+    if (!is.null(data_import_results())) {
+      if (!is.null(data_import_results()$data_configured)) {
+        new_import_status <- data_import_results()$data_configured
+      }
+    }
+    
+    # Safely check preferences status
+    if (!is.null(preferences_results())) {
+      if (!is.null(preferences_results()$configuration_saved)) {
+        new_preferences_status <- preferences_results()$configuration_saved
+      }
+    }
     
     # Update workflow state
     if (!workflow$data_import_complete && new_import_status) {
@@ -467,27 +513,6 @@ server <- function(input, output, session) {
         tags$li("📋 ", strong("Comprehensive Results Export:"), " Download complete analysis packages")
       ),
       
-      h4("Enhanced in v1.2.0:"),
-      tags$ul(
-        tags$li("🧠 ", strong("Intelligent Recommendations:"), " AI-powered parameter suggestions based on your data characteristics"),
-        tags$li("📊 ", strong("Advanced Quality Metrics:"), " Multi-method outlier detection, normality testing, and power analysis"),
-        tags$li("🔬 ", strong("Scientific Best Practices:"), " Built-in knowledge from 2025 functional connectivity research"),
-        tags$li("⚡ ", strong("Enhanced User Experience:"), " Streamlined workflow with smart navigation and visual feedback"),
-        tags$li("📖 ", strong("Contextual Help:"), " Extensive scientific guidance and method explanations")
-      ),
-      
-      h4("Scientific Foundation:"),
-      p("This application incorporates the latest advances in functional connectivity analysis, including:"),
-      tags$ul(
-        tags$li("Regularized partial correlation methods for small sample sizes"),
-        tags$li("Robust correlation approaches for outlier-prone data"),
-        tags$li("Sample size-aware parameter recommendations"),
-        tags$li("Multiple comparison correction strategies"),
-        tags$li("Statistical power considerations for network analysis")
-      ),
-      
-      p(tags$i("Built for neuroscientists, by neuroscientists. Incorporating evidence-based recommendations from recent methodological advances in brain network analysis.")),
-      
       footer = modalButton("Close"),
       size = "l",
       easyClose = TRUE
@@ -495,103 +520,24 @@ server <- function(input, output, session) {
   })
   
   # Enhanced error handling and user feedback
-  session$onUnhandledError(function() {
+  session$onSessionEnded(function() {
+    message("Session ended. Cleaning up...")
+  })
+  
+  observeEvent(shiny::getShinyOption("shiny.error"), {
+    err <- shiny::getShinyOption("shiny.error")
+    message("Error occurred: ", err$message)
+    
     shiny::showNotification(
-      "An unexpected error occurred. Please try refreshing the page or contact support if the problem persists.",
+      HTML(paste0(
+        "<strong>An unexpected error occurred:</strong><br/>",
+        "Please check the console for more details."
+      )),
       type = "error",
       duration = 10
     )
   })
-  
-  # Session info for debugging (only in development)
-  observe({
-    # Check if we're in a local/development environment
-    is_local <- identical(Sys.getenv("SHINY_SERVER_VERSION"), "")
-    
-    if (is_local) {
-      # Add any debugging or session management code here
-      # This block only runs when launching locally
-    }
-  })
 }
 
-# Enhanced JavaScript for better user experience
-jsCode <- "
-$(document).ready(function() {
-  // Enhanced help panel functionality
-  window.toggleHelpPanel = function(panelId) {
-    $('#' + panelId).toggleClass('active');
-  };
-  
-  // Smooth scrolling for navigation
-  function smoothScrollToTop() {
-    $('html, body').animate({scrollTop: 0}, 'fast');
-  }
-  
-  // Enhanced event handlers
-  $(document).on('shiny:connected', function() {
-    console.log('Brain Network Analysis App Connected');
-    
-    setTimeout(function() {
-      // Help panel toggles
-      $('.help-title').off('click').on('click', function() {
-        $(this).parent().toggleClass('active');
-      });
-      
-      // Display type selectors for results
-      $('.display-type-box').off('click').on('click', function() {
-        $('.display-type-box').removeClass('active');
-        $(this).addClass('active');
-        
-        var value = $(this).data('value');
-        $('#results-display_type').val(value).trigger('change');
-      });
-      
-      // Smooth transitions for tab changes
-      $('a[data-toggle=\"tab\"]').on('shown.bs.tab', function() {
-        smoothScrollToTop();
-      });
-      
-    }, 1000);
-  });
-  
-  // Re-attach handlers after Shiny updates
-  $(document).on('shiny:value', function(event) {
-    setTimeout(function() {
-      $('.help-title').off('click').on('click', function() {
-        $(this).parent().toggleClass('active');
-      });
-    }, 500);
-  });
-  
-  // Enhanced notification styling
-  $(document).on('shiny:notification-show', function(event) {
-    setTimeout(function() {
-      $('.shiny-notification').addClass('enhanced-notification');
-    }, 100);
-  });
-  
-  // Keyboard shortcuts (optional)
-  $(document).keydown(function(e) {
-    // Ctrl+H to toggle all help panels
-    if (e.ctrlKey && e.keyCode === 72) {
-      $('.help-panel').toggleClass('active');
-      e.preventDefault();
-    }
-  });
-});
-"
-
-# Add the JavaScript to the UI
-ui <- tagList(ui, tags$script(HTML(jsCode)))
-
-# Run the application with enhanced options
-shiny::shinyApp(
-  ui = ui, 
-  server = server,
-  options = list(
-    launch.browser = TRUE,
-    host = "0.0.0.0",
-    port = NULL
-  )
-)
+# Run the application 
+shiny::shinyApp(ui = ui, server = server)
