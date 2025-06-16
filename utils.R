@@ -608,7 +608,8 @@ create_correlation_network <- function(data, region_columns,
         for (j in 1:i) {
           if (i != j) {
             # Robust correlation using MASS package
-            rob_cor <- MASS::cov.rob(region_data[, c(i, j)])
+            # Use column names instead of indices to avoid indexing errors
+            rob_cor <- MASS::cov.rob(region_data[, c(region_columns[i], region_columns[j]), drop = FALSE])
             correlation_matrix[i, j] <- rob_cor$cor[1, 2]
             correlation_matrix[j, i] <- rob_cor$cor[1, 2]
           }
@@ -648,10 +649,10 @@ create_correlation_network <- function(data, region_columns,
     
     # Set row and column names if they're missing
     if (is.null(rownames(correlation_matrix))) {
-      rownames(correlation_matrix) <- region_columns
+      rownames(correlation_matrix) <- colnames(complete_data)
     }
     if (is.null(colnames(correlation_matrix))) {
-      colnames(correlation_matrix) <- region_columns
+      colnames(correlation_matrix) <- colnames(complete_data)
     }
     
     # Handle any remaining NA values
@@ -667,12 +668,17 @@ create_correlation_network <- function(data, region_columns,
     # Scale by standard deviations to make comparable to correlation
     std_devs <- apply(region_data, 2, sd, na.rm = TRUE)
     correlation_matrix <- matrix(0, ncol(region_data), ncol(region_data))
-    rownames(correlation_matrix) <- region_columns
-    colnames(correlation_matrix) <- region_columns
+    rownames(correlation_matrix) <- colnames(region_data)
+    colnames(correlation_matrix) <- colnames(region_data)
     
     for (i in 1:ncol(region_data)) {
       for (j in 1:ncol(region_data)) {
-        correlation_matrix[i, j] <- covariance_matrix[i, j] / (std_devs[i] * std_devs[j])
+        # Check for zero standard deviations to avoid division by zero
+        if (std_devs[i] > 0 && std_devs[j] > 0) {
+          correlation_matrix[i, j] <- covariance_matrix[i, j] / (std_devs[i] * std_devs[j])
+        } else {
+          correlation_matrix[i, j] <- 0
+        }
       }
     }
   }
@@ -700,48 +706,37 @@ create_correlation_network <- function(data, region_columns,
   # Calculate statistical significance
   p_value_matrix <- calculate_significance(correlation_matrix, nrow(region_data))
   
-  # Convert to edge list using base R approach (more robust)
-  # Get row and column indices
-  n_regions <- nrow(correlation_matrix)
-  row_indices <- rep(1:n_regions, each = n_regions)
-  col_indices <- rep(1:n_regions, times = n_regions)
+  # ============= FIXED EDGE LIST CREATION ==================
+  # Ensure rownames and colnames are present before creating edge list
+  if (is.null(rownames(correlation_matrix)) || is.null(colnames(correlation_matrix))) {
+    rownames(correlation_matrix) <- colnames(correlation_matrix) <- region_columns
+  }
   
-  # Create edge list manually
-  edge_data <- data.frame(
-    Var1 = rownames(correlation_matrix)[row_indices],
-    Var2 = colnames(correlation_matrix)[col_indices],
-    value = as.vector(correlation_matrix),
+  # Create edge list using a safer method that doesn't rely on vectorization
+  n_regions <- nrow(correlation_matrix)
+  edge_list <- data.frame(
+    Var1 = character(),
+    Var2 = character(),
+    value = numeric(),
     stringsAsFactors = FALSE
   )
   
-  # Ensure all columns are correct types
-  edge_data$Var1 <- as.character(edge_data$Var1)
-  edge_data$Var2 <- as.character(edge_data$Var2)
-  edge_data$value <- as.numeric(edge_data$value)
-  
-  # Remove problematic values
-  valid_rows <- !is.na(edge_data$value) & 
-    !is.infinite(edge_data$value) & 
-    edge_data$Var1 != edge_data$Var2  # Remove self-loops
-  
-  edge_data <- edge_data[valid_rows, ]
-  
-  # Filter for correlations above threshold
-  threshold_rows <- abs(edge_data$value) > correlation_threshold
-  edge_data <- edge_data[threshold_rows, ]
-  
-  # Remove duplicate edges (keep only unique undirected pairs)
-  edge_data$from <- pmin(edge_data$Var1, edge_data$Var2)
-  edge_data$to <- pmax(edge_data$Var1, edge_data$Var2)
-  
-  # Remove duplicates
-  edge_data <- edge_data[!duplicated(paste(edge_data$from, edge_data$to)), ]
-  
-  # Create final filtered correlation data
-  filtered_correlation <- edge_data[, c("Var1", "Var2", "value")]
-  
-  # Create edge list for graph creation
-  edge_list <- filtered_correlation[, c("Var1", "Var2", "value")]
+  # Build edge list manually by looping through the matrix
+  for (i in 1:n_regions) {
+    for (j in 1:n_regions) {
+      if (i != j) {  # Skip self-loops
+        # Check if correlation is above threshold
+        if (abs(correlation_matrix[i, j]) > correlation_threshold) {
+          edge_list <- rbind(edge_list, data.frame(
+            Var1 = rownames(correlation_matrix)[i],
+            Var2 = colnames(correlation_matrix)[j],
+            value = correlation_matrix[i, j],
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+  }
   
   # Skip if no edges remain after filtering
   if (nrow(edge_list) == 0) {
@@ -754,18 +749,28 @@ create_correlation_network <- function(data, region_columns,
     ))
   }
   
+  # Remove duplicate edges (keep only unique undirected pairs)
+  edge_list$from <- pmin(edge_list$Var1, edge_list$Var2)
+  edge_list$to <- pmax(edge_list$Var1, edge_list$Var2)
+  
+  # Remove duplicates
+  edge_list <- edge_list[!duplicated(paste(edge_list$from, edge_list$to)), ]
+  
+  # Create final filtered correlation data
+  filtered_correlation <- edge_list[, c("Var1", "Var2", "value")]
+  
   # Create the graph object
-  graph <- igraph::graph_from_data_frame(edge_list, directed = FALSE)
+  graph <- igraph::graph_from_data_frame(filtered_correlation, directed = FALSE)
   
   # Assign edge weights
-  igraph::E(graph)$weight <- abs(edge_list$value)  # Absolute values for layout
-  igraph::E(graph)$original_weight <- edge_list$value  # Original values for coloring
+  igraph::E(graph)$weight <- abs(filtered_correlation$value)  # Absolute values for layout
+  igraph::E(graph)$original_weight <- filtered_correlation$value  # Original values for coloring
   
   return(list(
     correlation_matrix = correlation_matrix,
     p_value_matrix = p_value_matrix,
     graph = graph,
-    edge_list = edge_list,
+    edge_list = filtered_correlation,
     message = paste0("Created network with ", 
                      igraph::vcount(graph), " nodes and ", 
                      igraph::ecount(graph), " edges")
@@ -1054,41 +1059,58 @@ run_network_analysis_by_group <- function(data, region_columns, group_column,
       next
     }
     
-    # Create network
-    network_result <- create_correlation_network(
-      group_data, 
-      region_columns, 
-      correlation_threshold, 
-      correlation_method,
-      correlation_type,
-      use_robust,
-      use_regularization
-    )
+    # Debug information
+    cat("Processing group:", group, "\n")
+    cat("Group data dimensions:", nrow(group_data), "x", ncol(group_data), "\n")
+    cat("Region columns:", paste(region_columns, collapse=", "), "\n")
     
-    # Store network
-    networks[[group]] <- network_result
-    
-    # Store significance matrices
-    if (perform_significance) {
-      if (apply_fdr) {
-        significance_matrices[[group]] <- apply_fdr_correction(network_result$p_value_matrix)
-      } else {
-        significance_matrices[[group]] <- network_result$p_value_matrix
-      }
+    # Verify all region columns exist in the data
+    missing_cols <- setdiff(region_columns, names(group_data))
+    if (length(missing_cols) > 0) {
+      warning(paste("Missing region columns in group", group, ":", 
+                    paste(missing_cols, collapse=", ")))
+      next
     }
     
-    # If network was created successfully, calculate metrics
-    if (!is.null(network_result$graph)) {
-      # Calculate global metrics
-      group_global_metrics <- calculate_global_metrics(network_result$graph)
-      group_global_metrics$Group <- group
-      global_metrics <- rbind(global_metrics, group_global_metrics)
+    # Create network with error handling
+    tryCatch({
+      network_result <- create_correlation_network(
+        group_data, 
+        region_columns, 
+        correlation_threshold, 
+        correlation_method,
+        correlation_type,
+        use_robust,
+        use_regularization
+      )
       
-      # Calculate node metrics
-      group_node_metrics <- calculate_node_metrics(network_result$graph)
-      group_node_metrics$Group <- group
-      node_metrics <- rbind(node_metrics, group_node_metrics)
-    }
+      # Store network
+      networks[[group]] <- network_result
+      
+      # Store significance matrices
+      if (perform_significance) {
+        if (apply_fdr) {
+          significance_matrices[[group]] <- apply_fdr_correction(network_result$p_value_matrix)
+        } else {
+          significance_matrices[[group]] <- network_result$p_value_matrix
+        }
+      }
+      
+      # If network was created successfully, calculate metrics
+      if (!is.null(network_result$graph)) {
+        # Calculate global metrics
+        group_global_metrics <- calculate_global_metrics(network_result$graph)
+        group_global_metrics$Group <- group
+        global_metrics <- rbind(global_metrics, group_global_metrics)
+        
+        # Calculate node metrics
+        group_node_metrics <- calculate_node_metrics(network_result$graph)
+        group_node_metrics$Group <- group
+        node_metrics <- rbind(node_metrics, group_node_metrics)
+      }
+    }, error = function(e) {
+      warning(paste("Error in network analysis for group", group, ":", e$message))
+    })
   }
   
   return(list(
@@ -1299,37 +1321,55 @@ plot_network <- function(graph, node_metrics = NULL,
     # Create a copy of the graph to filter
     filtered_graph <- graph
     
-    # Get edge list
-    edge_list <- igraph::as_data_frame(graph, what = "edges")
-    
-    # Check each edge against significance matrix
-    edges_to_remove <- c()
-    for (i in 1:nrow(edge_list)) {
-      from_node <- edge_list$from[i]
-      to_node <- edge_list$to[i]
-      
-      # Check p-value against threshold
-      if (significant_edges[from_node, to_node] > significance_threshold) {
-        edges_to_remove <- c(edges_to_remove, i)
-      }
-    }
-    
-    # Remove non-significant edges if any
-    if (length(edges_to_remove) > 0) {
-      filtered_graph <- igraph::delete_edges(graph, edges_to_remove)
-    }
-    
-    # Use the filtered graph for plotting
-    graph <- filtered_graph
-    
-    # Check if any edges remain
-    if (igraph::ecount(graph) == 0) {
+    # Check if we have no edges, if so just return the empty graph message
+    if (igraph::ecount(filtered_graph) == 0) {
       return(ggplot2::ggplot() +
                ggplot2::annotate("text", x = 0, y = 0, 
-                                 label = "No significant connections above threshold") +
+                                 label = "No network connections above threshold") +
                ggplot2::theme_void() +
                ggplot2::labs(title = title))
     }
+    
+    # Get edge list with error handling
+    tryCatch({
+      edge_list <- igraph::as_data_frame(graph, what = "edges")
+      
+      # Check each edge against significance matrix
+      edges_to_remove <- c()
+      for (i in 1:nrow(edge_list)) {
+        from_node <- edge_list$from[i]
+        to_node <- edge_list$to[i]
+        
+        # Make sure nodes exist in the significance matrix
+        if (from_node %in% rownames(significant_edges) && 
+            to_node %in% colnames(significant_edges)) {
+          # Check p-value against threshold
+          if (significant_edges[from_node, to_node] > significance_threshold) {
+            edges_to_remove <- c(edges_to_remove, i)
+          }
+        }
+      }
+      
+      # Remove non-significant edges if any
+      if (length(edges_to_remove) > 0) {
+        filtered_graph <- igraph::delete_edges(graph, edges_to_remove)
+      }
+      
+      # Use the filtered graph for plotting
+      graph <- filtered_graph
+      
+      # Check if any edges remain
+      if (igraph::ecount(graph) == 0) {
+        return(ggplot2::ggplot() +
+                 ggplot2::annotate("text", x = 0, y = 0, 
+                                   label = "No significant connections above threshold") +
+                 ggplot2::theme_void() +
+                 ggplot2::labs(title = title))
+      }
+    }, error = function(e) {
+      warning(paste("Error filtering edges by significance:", e$message))
+      # Continue with the original graph if there's an error
+    })
   }
   
   # Use the provided uniform_node_size parameter for fixed sizing
@@ -1337,9 +1377,16 @@ plot_network <- function(graph, node_metrics = NULL,
   
   # Add node attributes from metrics if provided
   if (!is.null(node_metrics)) {
+    # Check if the graph has vertex names
+    if (is.null(igraph::V(graph)$name)) {
+      # If no names, assign default names
+      igraph::V(graph)$name <- paste0("Node", 1:igraph::vcount(graph))
+    }
+    
     # Match nodes in graph with metrics
     for (node in igraph::V(graph)$name) {
-      metric_row <- node_metrics[node_metrics$Node == node, ]
+      # Find the node in metrics data
+      metric_row <- node_metrics[node_metrics$Node == node, , drop = FALSE]
       if (nrow(metric_row) > 0) {
         # Add attributes to the graph
         if ("Brain_Area" %in% names(metric_row) && color_by == "brain_area") {
@@ -1361,25 +1408,59 @@ plot_network <- function(graph, node_metrics = NULL,
     if (is.null(area_colors)) {
       # Create default colors if not provided
       unique_areas <- unique(igraph::vertex_attr(graph, "area"))
-      area_colors <- setNames(
-        scales::hue_pal()(length(unique_areas)),
-        unique_areas
-      )
+      if (length(unique_areas) > 0) {
+        area_colors <- setNames(
+          scales::hue_pal()(length(unique_areas)),
+          unique_areas
+        )
+      } else {
+        # Default single color if no areas found
+        area_colors <- c("Unknown" = "#1F78B4")
+      }
     }
-    igraph::V(graph)$color <- area_colors[igraph::V(graph)$area]
+    
+    # Create a vector for vertex colors, with error handling
+    vertex_colors <- rep("#1F78B4", igraph::vcount(graph)) # Default color
+    for (i in 1:igraph::vcount(graph)) {
+      v_name <- igraph::V(graph)[i]$name
+      v_area <- igraph::vertex_attr(graph, "area", index = i)
+      if (!is.null(v_area) && v_area %in% names(area_colors)) {
+        vertex_colors[i] <- area_colors[v_area]
+      }
+    }
+    igraph::V(graph)$color <- vertex_colors
+    
   } else if (color_by == "community" && "community" %in% igraph::vertex_attr_names(graph)) {
     # Color by community membership
     communities <- unique(igraph::vertex_attr(graph, "community"))
-    comm_colors <- setNames(
-      scales::hue_pal()(length(communities)),
-      communities
-    )
-    igraph::V(graph)$color <- comm_colors[igraph::V(graph)$community]
+    if (length(communities) > 0) {
+      comm_colors <- setNames(
+        scales::hue_pal()(length(communities)),
+        communities
+      )
+      
+      # Assign colors with error handling
+      vertex_colors <- rep("#1F78B4", igraph::vcount(graph)) # Default color
+      for (i in 1:igraph::vcount(graph)) {
+        v_comm <- igraph::vertex_attr(graph, "community", index = i)
+        if (!is.null(v_comm) && !is.na(v_comm) && v_comm %in% names(comm_colors)) {
+          vertex_colors[i] <- comm_colors[v_comm]
+        }
+      }
+      igraph::V(graph)$color <- vertex_colors
+    } else {
+      igraph::V(graph)$color <- "#1F78B4" # Default color
+    }
   } else if (color_by == "metric" && !is.null(size_by) && "size" %in% igraph::vertex_attr_names(graph)) {
     # Color by the same metric used for sizing
-    igraph::V(graph)$color <- scales::gradient_n_pal(
-      c("#F8766D", "#00BA38", "#619CFF")
-    )(scales::rescale(igraph::V(graph)$size))
+    sizes <- igraph::vertex_attr(graph, "size")
+    if (length(sizes) > 0 && !all(is.na(sizes))) {
+      igraph::V(graph)$color <- scales::gradient_n_pal(
+        c("#F8766D", "#00BA38", "#619CFF")
+      )(scales::rescale(sizes))
+    } else {
+      igraph::V(graph)$color <- "#1F78B4" # Default color
+    }
   } else {
     # Default coloring
     igraph::V(graph)$color <- "#1F78B4"
@@ -1389,14 +1470,21 @@ plot_network <- function(graph, node_metrics = NULL,
   if (!is.null(size_by) && size_by != "uniform" && "size" %in% igraph::vertex_attr_names(graph)) {
     # Scale sizes between min_size and max_size
     sizes <- igraph::vertex_attr(graph, "size")
-    min_size <- 5
-    max_size <- 20
-    if (max(sizes) > min(sizes)) {
-      scaled_sizes <- scales::rescale(sizes, to = c(min_size, max_size))
-      igraph::V(graph)$scaled_size <- scaled_sizes
+    if (length(sizes) > 0 && !all(is.na(sizes))) {
+      min_size <- 5
+      max_size <- 20
+      
+      # Check if we have different values before scaling
+      if (max(sizes, na.rm = TRUE) > min(sizes, na.rm = TRUE)) {
+        scaled_sizes <- scales::rescale(sizes, to = c(min_size, max_size))
+        igraph::V(graph)$scaled_size <- scaled_sizes
+      } else {
+        # If all sizes are the same, use the average of min and max size
+        igraph::V(graph)$scaled_size <- rep((min_size + max_size) / 2, length(sizes))
+      }
     } else {
-      # If all sizes are the same, use the average of min and max size
-      igraph::V(graph)$scaled_size <- rep((min_size + max_size) / 2, length(sizes))
+      # Fallback to uniform size
+      igraph::V(graph)$scaled_size <- rep(fixed_node_size, igraph::vcount(graph))
     }
   } else {
     # Set uniform size for all nodes using the provided parameter
@@ -1475,6 +1563,7 @@ plot_network <- function(graph, node_metrics = NULL,
       igraph::layout_with_lgl(graph)
     }, error = function(e) {
       # Fall back to FR if LGL fails
+      warning("LGL layout failed, falling back to FR layout")
       igraph::layout_with_fr(graph)
     })
   } else if (layout == "circle") {
@@ -1484,6 +1573,7 @@ plot_network <- function(graph, node_metrics = NULL,
       igraph::layout_on_grid(graph)
     }, error = function(e) {
       # Fall back to FR if grid fails
+      warning("Grid layout failed, falling back to FR layout")
       igraph::layout_with_fr(graph)
     })
   } else if (layout == "star") {
@@ -1491,6 +1581,7 @@ plot_network <- function(graph, node_metrics = NULL,
       igraph::layout_as_star(graph)
     }, error = function(e) {
       # Fall back to FR if star fails
+      warning("Star layout failed, falling back to FR layout")
       igraph::layout_with_fr(graph)
     })
   } else {
@@ -1498,88 +1589,105 @@ plot_network <- function(graph, node_metrics = NULL,
     graph_layout <- igraph::layout_with_fr(graph)
   }
   
+  # Check for edge attributes and add if missing
+  if (!("original_weight" %in% igraph::edge_attr_names(graph))) {
+    igraph::E(graph)$original_weight <- 1  # Default positive weight
+  }
+  
   # Add explicit edge color attribute based on sign
   igraph::E(graph)$edge_color <- ifelse(igraph::E(graph)$original_weight > 0, "red", "blue")
   
   # Create plot using ggraph
-  p <- ggraph::ggraph(graph, layout = graph_layout) + 
-    # Add edges first (lowest layer)
-    ggraph::geom_edge_link(
-      ggplot2::aes(
-        width = abs(igraph::E(graph)$original_weight),
-        colour = igraph::E(graph)$edge_color
-      ),
-      alpha = 0.7
-    ) 
-  
-  # Add edge labels if requested
-  if (show_edge_labels) {
-    p <- p + ggraph::geom_edge_text(
-      ggplot2::aes(
-        label = round(igraph::E(graph)$original_weight, 2)
-      ),
-      size = 3,
-      angle = 0
-    )
-  }
-  
-  # Add nodes (middle layer)
-  p <- p + ggraph::geom_node_point(
-    ggplot2::aes(color = igraph::V(graph)$color, size = igraph::V(graph)$scaled_size)
-  )
-  
-  # Add node labels if requested
-  if (show_node_labels) {
-    p <- p + ggraph::geom_node_text(
-      ggplot2::aes(label = name),
-      size = 3.5,
-      color = "black",
-      fontface = "bold",
-      repel = FALSE,  # Don't repel to keep centered
-      show.legend = FALSE
-    )
-  }
-  
-  # Use ggraph functions for edge aesthetics
-  p <- p + ggraph::scale_edge_colour_identity(
-    name = "Correlation",
-    guide = "legend",
-    labels = c("Positive", "Negative")
-  ) +
-    ggraph::scale_edge_width_continuous(
-      name = "Strength",
-      range = c(0.3, 2)
-    ) +
-    ggplot2::scale_color_identity() +
-    ggplot2::scale_size_identity() +
-    ggplot2::labs(title = title) +
-    ggplot2::theme_void() +
-    ggplot2::theme(
-      plot.title = ggplot2::element_text(hjust = 0.5),
-      legend.position = "right"
-    )
-  
-  # Create legend for brain areas if coloring by area
-  if (color_by == "brain_area" && "area" %in% igraph::vertex_attr_names(graph)) {
-    # Get unique areas and their colors
-    unique_areas <- unique(igraph::vertex_attr(graph, "area"))
-    area_colors_used <- area_colors[unique_areas]
+  tryCatch({
+    p <- ggraph::ggraph(graph, layout = graph_layout) + 
+      # Add edges first (lowest layer)
+      ggraph::geom_edge_link(
+        ggplot2::aes(
+          width = abs(igraph::E(graph)$original_weight),
+          colour = igraph::E(graph)$edge_color
+        ),
+        alpha = 0.7
+      ) 
     
-    # Add manual color scale for the legend
-    p <- p + 
-      ggplot2::guides(
-        edge_colour = ggplot2::guide_legend(title = "Correlation"),
-        edge_width = ggplot2::guide_legend(title = "Strength")
-      ) +
-      ggplot2::scale_color_identity(
-        name = "Brain Area",
-        breaks = area_colors_used,
-        labels = unique_areas,
-        guide = "legend"
+    # Add edge labels if requested
+    if (show_edge_labels) {
+      p <- p + ggraph::geom_edge_text(
+        ggplot2::aes(
+          label = round(igraph::E(graph)$original_weight, 2)
+        ),
+        size = 3,
+        angle = 0
       )
-  }
-  
-  return(p)
+    }
+    
+    # Add nodes (middle layer)
+    p <- p + ggraph::geom_node_point(
+      ggplot2::aes(color = igraph::V(graph)$color, size = igraph::V(graph)$scaled_size)
+    )
+    
+    # Add node labels if requested
+    if (show_node_labels) {
+      p <- p + ggraph::geom_node_text(
+        ggplot2::aes(label = name),
+        size = 3.5,
+        color = "black",
+        fontface = "bold",
+        repel = FALSE,  # Don't repel to keep centered
+        show.legend = FALSE
+      )
+    }
+    
+    # Use ggraph functions for edge aesthetics
+    p <- p + ggraph::scale_edge_colour_identity(
+      name = "Correlation",
+      guide = "legend",
+      labels = c("Positive", "Negative")
+    ) +
+      ggraph::scale_edge_width_continuous(
+        name = "Strength",
+        range = c(0.3, 2)
+      ) +
+      ggplot2::scale_color_identity() +
+      ggplot2::scale_size_identity() +
+      ggplot2::labs(title = title) +
+      ggplot2::theme_void() +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(hjust = 0.5),
+        legend.position = "right"
+      )
+    
+    # Create legend for brain areas if coloring by area
+    if (color_by == "brain_area" && "area" %in% igraph::vertex_attr_names(graph)) {
+      # Get unique areas and their colors
+      unique_areas <- unique(igraph::vertex_attr(graph, "area"))
+      if (length(unique_areas) > 0 && !is.null(area_colors)) {
+        area_colors_used <- area_colors[unique_areas]
+        
+        # Add manual color scale for the legend
+        p <- p + 
+          ggplot2::guides(
+            edge_colour = ggplot2::guide_legend(title = "Correlation"),
+            edge_width = ggplot2::guide_legend(title = "Strength")
+          ) +
+          ggplot2::scale_color_identity(
+            name = "Brain Area",
+            breaks = area_colors_used,
+            labels = unique_areas,
+            guide = "legend"
+          )
+      }
+    }
+    
+    return(p)
+  }, error = function(e) {
+    warning(paste("Error in plot_network:", e$message))
+    # Return a basic error plot
+    return(ggplot2::ggplot() +
+             ggplot2::annotate("text", x = 0, y = 0, 
+                               label = paste("Error generating plot:", e$message)) +
+             ggplot2::theme_void() +
+             ggplot2::labs(title = title))
+  })
 }
 
 #' Safely save plots to a file
