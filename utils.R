@@ -574,6 +574,18 @@ generate_advanced_recommendations <- function(quality_metrics, n_regions) {
 #' @param use_regularization Whether to use regularization for partial correlation
 #' @return List containing correlation matrix and graph object
 #' @export
+# Fixed create_correlation_network function with improved edge list handling
+#' Create a correlation network from brain region data
+#' 
+#' @param data Data frame containing brain region data
+#' @param region_columns Vector of column names containing brain region data
+#' @param correlation_threshold Threshold for including edges in the network
+#' @param correlation_method Method for correlation calculation (default "pearson")
+#' @param correlation_type Type of correlation to use ("standard" or "partial")
+#' @param use_robust Whether to use robust correlation (less sensitive to outliers)
+#' @param use_regularization Whether to use regularization for partial correlation
+#' @return List containing correlation matrix and graph object
+#' @export
 create_correlation_network <- function(data, region_columns, 
                                        correlation_threshold = 0.3,
                                        correlation_method = "pearson",
@@ -582,6 +594,33 @@ create_correlation_network <- function(data, region_columns,
                                        use_regularization = TRUE) {
   if (!requireNamespace("igraph", quietly = TRUE)) {
     stop("Package 'igraph' is required for this function")
+  }
+  
+  # Add input validation to handle list parameters
+  # This fixes the "invalid 'type' (list) of argument" error
+  if (is.list(correlation_method)) {
+    warning("correlation_method is a list, using default 'pearson'")
+    correlation_method <- "pearson"
+  }
+  
+  if (is.list(correlation_type)) {
+    warning("correlation_type is a list, using default 'standard'")
+    correlation_type <- "standard"
+  }
+  
+  if (is.list(correlation_threshold)) {
+    warning("correlation_threshold is a list, using default 0.3")
+    correlation_threshold <- 0.3
+  }
+  
+  if (is.list(use_robust)) {
+    warning("use_robust is a list, using default FALSE")
+    use_robust <- FALSE
+  }
+  
+  if (is.list(use_regularization)) {
+    warning("use_regularization is a list, using default TRUE")
+    use_regularization <- TRUE
   }
   
   # Extract region data
@@ -594,7 +633,7 @@ create_correlation_network <- function(data, region_columns,
       correlation_matrix <- cor(region_data, use = "pairwise.complete.obs", 
                                 method = correlation_method)
     } else {
-      # Robust correlation
+      # FIXED: More robust implementation of robust correlation
       if (!requireNamespace("MASS", quietly = TRUE)) {
         stop("Package 'MASS' is required for robust correlation")
       }
@@ -604,17 +643,97 @@ create_correlation_network <- function(data, region_columns,
       rownames(correlation_matrix) <- region_columns
       colnames(correlation_matrix) <- region_columns
       
-      for (i in 1:n_regions) {
-        for (j in 1:i) {
-          if (i != j) {
-            # Robust correlation using MASS package
-            # Use column names instead of indices to avoid indexing errors
-            rob_cor <- MASS::cov.rob(region_data[, c(region_columns[i], region_columns[j]), drop = FALSE])
-            correlation_matrix[i, j] <- rob_cor$cor[1, 2]
-            correlation_matrix[j, i] <- rob_cor$cor[1, 2]
+      # First approach: Try with complete data to avoid individual pairwise calculations
+      tryCatch({
+        # Remove rows with any missing values
+        complete_data <- region_data[complete.cases(region_data), ]
+        
+        # Only proceed if we have enough complete cases
+        if (nrow(complete_data) >= 3) {
+          # Calculate robust correlation matrix directly
+          rob_cor <- MASS::cov.rob(complete_data)
+          
+          # Extract the correlation matrix from the result
+          rob_cor_matrix <- cov2cor(rob_cor$cov)
+          
+          # Assign to correlation_matrix
+          correlation_matrix <- rob_cor_matrix
+        } else {
+          # Fall back to pairwise approach if not enough complete cases
+          stop("Not enough complete cases for direct robust correlation")
+        }
+      }, error = function(e) {
+        # Fall back to pairwise approach if direct approach fails
+        warning(paste("Falling back to pairwise robust correlation:", e$message))
+        
+        # Calculate correlations pairwise
+        for (i in 1:n_regions) {
+          for (j in 1:i) {
+            if (i != j) {
+              # Extract the two columns
+              col_i <- region_data[[region_columns[i]]]
+              col_j <- region_data[[region_columns[j]]]
+              
+              # Skip if insufficient data
+              valid_indices <- !is.na(col_i) & !is.na(col_j)
+              if (sum(valid_indices) < 3) {
+                correlation_matrix[i, j] <- 0
+                correlation_matrix[j, i] <- 0
+                next
+              }
+              
+              # Create a data frame with only these two columns (complete cases only)
+              pair_data <- data.frame(
+                x = col_i[valid_indices],
+                y = col_j[valid_indices]
+              )
+              
+              # Calculate robust correlation
+              tryCatch({
+                # Try different robust correlation methods
+                if (nrow(pair_data) >= 5) {
+                  # Preferred method with enough data
+                  rob_pair <- MASS::cov.rob(pair_data)
+                  # Get correlation from covariance
+                  r <- rob_pair$cov[1, 2] / sqrt(rob_pair$cov[1, 1] * rob_pair$cov[2, 2])
+                } else if (nrow(pair_data) >= 3) {
+                  # Simpler method for very small samples
+                  rob_pair <- stats::cor(pair_data$x, pair_data$y, method = "spearman")
+                  r <- rob_pair
+                } else {
+                  # Default to zero if not enough data
+                  r <- 0
+                }
+                
+                # Ensure r is within [-1, 1]
+                r <- max(min(r, 1), -1)
+                
+                # Assign the correlation value to both positions in the matrix
+                correlation_matrix[i, j] <- r
+                correlation_matrix[j, i] <- r
+              }, error = function(e) {
+                # If robust correlation fails, use regular correlation
+                warning(paste("Robust correlation failed for pair", 
+                              region_columns[i], "-", region_columns[j], ":", e$message))
+                
+                # Attempt regular correlation
+                tryCatch({
+                  r <- stats::cor(pair_data$x, pair_data$y, method = correlation_method)
+                  correlation_matrix[i, j] <- r
+                  correlation_matrix[j, i] <- r
+                }, error = function(e2) {
+                  # If all fails, set to zero
+                  correlation_matrix[i, j] <- 0
+                  correlation_matrix[j, i] <- 0
+                })
+              })
+            }
           }
         }
-      }
+      })
+      
+      # Ensure diagonal is 1
+      diag(correlation_matrix) <- 1
     }
   } else if (correlation_type == "partial") {
     # Partial correlation
@@ -706,31 +825,31 @@ create_correlation_network <- function(data, region_columns,
   # Calculate statistical significance
   p_value_matrix <- calculate_significance(correlation_matrix, nrow(region_data))
   
-  # ============= FIXED EDGE LIST CREATION ==================
   # Ensure rownames and colnames are present before creating edge list
   if (is.null(rownames(correlation_matrix)) || is.null(colnames(correlation_matrix))) {
     rownames(correlation_matrix) <- colnames(correlation_matrix) <- region_columns
   }
   
-  # Create edge list using a safer method that doesn't rely on vectorization
+  # Create a proper undirected edge list with consistent ordering
   n_regions <- nrow(correlation_matrix)
-  edge_list <- data.frame(
-    Var1 = character(),
-    Var2 = character(),
-    value = numeric(),
+  undirected_edges <- data.frame(
+    from = character(),
+    to = character(),
+    weight = numeric(),
     stringsAsFactors = FALSE
   )
   
-  # Build edge list manually by looping through the matrix
+  # Only process the lower triangle of the matrix to avoid duplicates
   for (i in 1:n_regions) {
-    for (j in 1:n_regions) {
+    for (j in 1:i) {  # Only process j up to i to get lower triangle
       if (i != j) {  # Skip self-loops
         # Check if correlation is above threshold
         if (abs(correlation_matrix[i, j]) > correlation_threshold) {
-          edge_list <- rbind(edge_list, data.frame(
-            Var1 = rownames(correlation_matrix)[i],
-            Var2 = colnames(correlation_matrix)[j],
-            value = correlation_matrix[i, j],
+          # Always store edges with consistent ordering
+          undirected_edges <- rbind(undirected_edges, data.frame(
+            from = rownames(correlation_matrix)[j],  # smaller index first
+            to = rownames(correlation_matrix)[i],    # larger index second
+            weight = correlation_matrix[i, j],
             stringsAsFactors = FALSE
           ))
         }
@@ -739,7 +858,7 @@ create_correlation_network <- function(data, region_columns,
   }
   
   # Skip if no edges remain after filtering
-  if (nrow(edge_list) == 0) {
+  if (nrow(undirected_edges) == 0) {
     return(list(
       correlation_matrix = correlation_matrix,
       p_value_matrix = p_value_matrix,
@@ -749,32 +868,45 @@ create_correlation_network <- function(data, region_columns,
     ))
   }
   
-  # Remove duplicate edges (keep only unique undirected pairs)
-  edge_list$from <- pmin(edge_list$Var1, edge_list$Var2)
-  edge_list$to <- pmax(edge_list$Var1, edge_list$Var2)
-  
-  # Remove duplicates
-  edge_list <- edge_list[!duplicated(paste(edge_list$from, edge_list$to)), ]
-  
-  # Create final filtered correlation data
-  filtered_correlation <- edge_list[, c("Var1", "Var2", "value")]
-  
-  # Create the graph object
-  graph <- igraph::graph_from_data_frame(filtered_correlation, directed = FALSE)
-  
-  # Assign edge weights
-  igraph::E(graph)$weight <- abs(filtered_correlation$value)  # Absolute values for layout
-  igraph::E(graph)$original_weight <- filtered_correlation$value  # Original values for coloring
-  
-  return(list(
-    correlation_matrix = correlation_matrix,
-    p_value_matrix = p_value_matrix,
-    graph = graph,
-    edge_list = filtered_correlation,
-    message = paste0("Created network with ", 
-                     igraph::vcount(graph), " nodes and ", 
-                     igraph::ecount(graph), " edges")
-  ))
+  # Try to create the graph with better error handling
+  tryCatch({
+    # Create graph from undirected edges
+    graph <- igraph::graph_from_data_frame(undirected_edges, directed = FALSE)
+    
+    # Assign weights safely
+    if (igraph::ecount(graph) > 0) {
+      # Make sure weight vectors match exactly with number of edges
+      weights <- undirected_edges$weight
+      if (length(weights) == igraph::ecount(graph)) {
+        igraph::E(graph)$weight <- abs(weights)
+        igraph::E(graph)$original_weight <- weights
+      } else {
+        # Fall back to uniform weights if mismatch
+        warning("Edge count mismatch. Using uniform weights.")
+        igraph::E(graph)$weight <- rep(1, igraph::ecount(graph))
+        igraph::E(graph)$original_weight <- rep(1, igraph::ecount(graph))
+      }
+    }
+    
+    return(list(
+      correlation_matrix = correlation_matrix,
+      p_value_matrix = p_value_matrix,
+      graph = graph,
+      edge_list = undirected_edges,
+      message = paste0("Created network with ", 
+                       igraph::vcount(graph), " nodes and ", 
+                       igraph::ecount(graph), " edges")
+    ))
+  }, error = function(e) {
+    warning(paste("Error creating graph:", e$message))
+    return(list(
+      correlation_matrix = correlation_matrix,
+      p_value_matrix = p_value_matrix,
+      graph = NULL,
+      edge_list = undirected_edges,
+      message = paste("Error creating graph:", e$message)
+    ))
+  })
 }
 
 #' Calculate statistical significance of correlations
@@ -1039,6 +1171,42 @@ run_network_analysis_by_group <- function(data, region_columns, group_column,
                                           use_regularization = TRUE,
                                           perform_significance = TRUE,
                                           apply_fdr = TRUE) {
+  # Add input validation to handle list parameters
+  if (is.list(correlation_method)) {
+    warning("correlation_method is a list, using default 'pearson'")
+    correlation_method <- "pearson"
+  }
+  
+  if (is.list(correlation_type)) {
+    warning("correlation_type is a list, using default 'standard'")
+    correlation_type <- "standard"
+  }
+  
+  if (is.list(correlation_threshold)) {
+    warning("correlation_threshold is a list, using default 0.3")
+    correlation_threshold <- 0.3
+  }
+  
+  if (is.list(use_robust)) {
+    warning("use_robust is a list, using default FALSE")
+    use_robust <- FALSE
+  }
+  
+  if (is.list(use_regularization)) {
+    warning("use_regularization is a list, using default TRUE")
+    use_regularization <- TRUE
+  }
+  
+  if (is.list(perform_significance)) {
+    warning("perform_significance is a list, using default TRUE")
+    perform_significance <- TRUE
+  }
+  
+  if (is.list(apply_fdr)) {
+    warning("apply_fdr is a list, using default TRUE")
+    apply_fdr <- TRUE
+  }
+  
   # Get unique groups
   unique_groups <- unique(data[[group_column]])
   
