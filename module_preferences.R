@@ -715,149 +715,298 @@ preferences <- function(id, data_input) {
       return(id)
     }
     
-    # Enhanced recommendation generator
+    #' Generate comprehensive analysis recommendations based on data‑quality metrics
+    #'
+    #' This helper returns a named list of recommendation objects, each containing a
+    #' human‑readable *title*, *recommendation*, *details*, *rationale*, and a list
+    #' of *suggested_values* that can be programmatically fed back into the
+    #' analytical pipeline (e.g. UI defaults, config files, etc.).
+    #'
+    #' The logic has three major pillars:
+    #'   1. **Sample‑size driven guidance** – decide between standard vs. partial
+    #'      correlation, threshold strength, and (de‑)regularisation based on the
+    #'      smallest group size available ("effective" sample size).
+    #'   2. **Data‑distribution diagnostics** – steer the user toward Pearson or
+    #'      Spearman methods, flag robustness and outlier handling.
+    #'   3. **Multiple‑testing & data‑quality flags** – FDR, imputation, etc.
+    #'
+    #' @param data_quality_metrics A named list returned by the QC stage of the app.
+    #'        Expected fields (all optional):
+    #'          • sample_size (numeric) – total N if per‑group unavailable
+    #'          • group_balance      – list with $min_size per group
+    #'          • normality_tests    – list with $consensus_normal per region
+    #'          • outliers_by_region – list (used for n_regions fallback)
+    #'          • outliers_count     – scalar number of identified outliers
+    #'          • data_range_summary – list (used for n_regions fallback)
+    #'          • missing_percent    – numeric percentage of missing data
+    #'
+    #' @return Named list of recommendation entries (or NULL if no metrics supplied)
+    #' @examples
+    #' rec <- generate_comprehensive_recommendations(qc_metrics)
+    #' rec$sample_size$title
+    #' @export
+    
     generate_comprehensive_recommendations <- function(data_quality_metrics) {
       if (is.null(data_quality_metrics)) return(NULL)
       
       recommendations <- list()
       
-      # Use minimum group size instead of total sample size
-      n <- data_quality_metrics$sample_size
-      
-      # Check if we have group-specific information
-      min_group_size <- NULL
-      if (!is.null(data_quality_metrics$group_balance)) {
-        # Extract minimum group size from balance information
-        min_sizes <- sapply(data_quality_metrics$group_balance, function(x) x$min_size)
-        min_group_size <- min(min_sizes)
+      # ---------------------------------------------------------------------------
+      # Determine effective sample size (smallest group N if available)
+      # ---------------------------------------------------------------------------
+      effective_sample_size <- NULL
+      if (!is.null(data_quality_metrics$group_balance) &&
+          length(data_quality_metrics$group_balance) > 0) {
+        
+        min_sizes <- vapply(                                     # robust & fast
+          data_quality_metrics$group_balance,
+          FUN = function(x) if (!is.null(x$min_size)) as.numeric(x$min_size) else NA,
+          FUN.VALUE = numeric(1)
+        )
+        min_sizes <- min_sizes[!is.na(min_sizes)]
+        if (length(min_sizes) > 0) effective_sample_size <- min(min_sizes)
+      }
+      # Fallback to total sample size
+      if (is.null(effective_sample_size) || is.na(effective_sample_size)) {
+        effective_sample_size <- as.numeric(data_quality_metrics$sample_size)
       }
       
-      # Use minimum group size if available, otherwise fall back to total sample size
-      effective_sample_size <- if(!is.null(min_group_size)) min_group_size else n
-      n_regions <- length(data_input()$column_info$region_columns)
+      # ---------------------------------------------------------------------------
+      # How many brain‑region variables are we dealing with?
+      # ---------------------------------------------------------------------------
+      n_regions <- 0
+      if (!is.null(data_quality_metrics$normality_tests)) {
+        n_regions <- length(data_quality_metrics$normality_tests)
+      } else if (!is.null(data_quality_metrics$data_range_summary)) {
+        n_regions <- length(data_quality_metrics$data_range_summary)
+      } else if (!is.null(data_quality_metrics$outliers_by_region)) {
+        n_regions <- length(data_quality_metrics$outliers_by_region)
+      } else {
+        n_regions <- 10  # conservative default
+      }
       
-      # Now use effective_sample_size instead of n for recommendations
+      # ---------------------------------------------------------------------------
+      # === SAMPLE‑SIZE RECOMMENDATIONS ===========================================
+      # ---------------------------------------------------------------------------
       if (effective_sample_size < 10) {
+        
         recommendations$sample_size <- list(
           title = "Small Group Size Considerations",
-          recommendation = "Use conservative methods and higher thresholds",
-          details = paste0("With minimum group size of ", effective_sample_size, " subjects, use standard correlation with higher threshold (0.5-0.7) and avoid partial correlation unless regularized."),
-          rationale = "Small sample sizes per group are more susceptible to noise and overfitting. Conservative approaches improve reliability.",
+          recommendation = "Use standard correlation with higher thresholds and Spearman method",
+          details = sprintf("With minimum group size of %d subjects, use standard correlation with a higher threshold (0.5–0.7) and avoid partial correlation unless regularised.",
+                            effective_sample_size),
+          rationale = paste0(
+            "Small sample sizes (n=", effective_sample_size, " per group) require conservative approaches to maintain statistical validity. ",
+            "With fewer than 10 subjects per group, correlation estimates have high variance and are more susceptible to outlier influence. ",
+            "Higher thresholds (0.5–0.7) reduce false positives that commonly occur in small samples. ",
+            "Spearman correlation is recommended over Pearson because: (1) normality cannot be reliably assessed with small samples; ",
+            "(2) rank‑based methods are more robust to outliers; and (3) in small samples, even minor violations of normality ",
+            "significantly impact Pearson estimates but have less effect on Spearman."),
           suggested_values = list(
-            correlation_type = "standard",
-            correlation_threshold = 0.6,
-            correlation_method = "spearman",
-            use_robust = TRUE
+            correlation_type      = "standard",
+            correlation_threshold = 0.5,
+            correlation_method    = "spearman",
+            use_robust            = FALSE
           )
         )
+        
       } else if (effective_sample_size < 20) {
+        # Decide whether partial correlation is feasible
+        cor_type <- if (effective_sample_size >= n_regions) "partial" else "standard"
+        
+        cor_type_reason <- if (cor_type == "partial")
+          "partial correlation with regularisation is viable"
+        else
+          "standard correlation is recommended"
+        
+        # Text explaining the choice (constructed outside paste0 to avoid syntax traps)
+        cor_specific_text <- if (cor_type == "partial") {
+          sprintf("Partial correlation is viable because your sample size (%d) exceeds the number of brain regions (%d), but regularisation is still recommended to stabilise estimates. Partial correlation better isolates direct connections by controlling for indirect effects through other regions, which is valuable for network topology analysis. ",
+                  effective_sample_size, n_regions)
+        } else {
+          sprintf("Standard correlation is recommended because the sample‑to‑variable ratio (%d samples vs %d regions) is insufficient for reliable partial correlation. Standard correlation provides more stable estimates in this range. ",
+                  effective_sample_size, n_regions)
+        }
+        
         recommendations$sample_size <- list(
           title = "Moderate Group Size Strategy",
-          recommendation = "Balanced approach with regularization if using partial correlation",
-          details = paste0("With minimum group size of ", effective_sample_size, " subjects, you can use moderate thresholds (0.4-0.5) and consider partial correlation with regularization."),
-          rationale = "Moderate sample sizes allow for more sophisticated methods but still benefit from conservative parameter choices.",
+          recommendation = sprintf("Use %s correlation with moderate thresholds", cor_type),
+          details = sprintf("With minimum group size of %d subjects, you can use moderate thresholds (0.4–0.5) and %s.",
+                            effective_sample_size, cor_type_reason),
+          rationale = paste0(
+            "Moderate sample sizes (n=", effective_sample_size, " per group) provide better statistical stability than very small samples, ",
+            "but still require careful parameter selection. The threshold of 0.4 balances sensitivity and specificity. ",
+            cor_specific_text,
+            "Either Pearson or Spearman methods can be appropriate depending on your data distribution, with Spearman providing ",
+            "better robustness against outliers and non‑normal distributions common in preclinical studies."),
           suggested_values = list(
-            correlation_type = if (effective_sample_size >= n_regions) "partial" else "standard",
+            correlation_type      = cor_type,
             correlation_threshold = 0.4,
-            correlation_method = "pearson",
-            use_regularization = TRUE
+            correlation_method    = "pearson",
+            use_regularisation    = TRUE
           )
         )
+        
       } else {
+        # Large enough for flexible methods
         recommendations$sample_size <- list(
-          title = "Sufficient Group Size - Full Method Flexibility",
-          recommendation = "All methods available with lower thresholds",
-          details = paste0("With minimum group size of ", effective_sample_size, " subjects, you can reliably use partial correlation and lower thresholds (0.3-0.4)."),
-          rationale = "Large samples provide statistical power for detecting weaker connections and support advanced methods.",
+          title = "Sufficient Group Size – Full Method Flexibility",
+          recommendation = "Use partial correlation with lower thresholds",
+          details = sprintf("With minimum group size of %d subjects, you can reliably use partial correlation and lower thresholds (0.3–0.4).",
+                            effective_sample_size),
+          rationale = paste0(
+            "Larger sample sizes (n=", effective_sample_size, " per group) provide greater statistical power and estimation precision. ",
+            "Partial correlation is recommended as it better reflects direct connectivity by controlling for indirect connections. ",
+            "With adequate samples, correlation estimates are more stable, allowing for lower thresholds (0.3–0.4) that can detect ",
+            "weaker but potentially important connections while maintaining acceptable false‑positive rates. ",
+            "Regularisation is ", if (effective_sample_size < (n_regions * 2)) "still recommended" else "optional", 
+            " based on your sample‑to‑variable ratio (", effective_sample_size, " samples vs ", n_regions, " brain regions). ",
+            "Pearson correlation is appropriate with larger samples as the central‑limit theorem provides robustness even with modest deviations from normality."),
           suggested_values = list(
-            correlation_type = "partial",
+            correlation_type      = "partial",
             correlation_threshold = 0.3,
-            correlation_method = "pearson",
-            use_regularization = effective_sample_size < (n_regions * 2)
+            correlation_method    = "pearson",
+            use_regularisation    = effective_sample_size < (n_regions * 2)
           )
         )
       }
       
-      # Normality based recommendations
+      # ---------------------------------------------------------------------------
+      # === NORMALITY RECOMMENDATIONS ============================================
+      # ---------------------------------------------------------------------------
       non_normal_percent <- 0
-      if (length(data_quality_metrics$normality_tests) > 0) {
-        non_normal_count <- sum(sapply(data_quality_metrics$normality_tests, function(x) !x$consensus_normal))
+      if (!is.null(data_quality_metrics$normality_tests) &&
+          length(data_quality_metrics$normality_tests) > 0) {
+        non_normal_count <- sum(vapply(
+          data_quality_metrics$normality_tests,
+          FUN = function(x) !is.null(x) && !is.null(x$consensus_normal) && !x$consensus_normal,
+          FUN.VALUE = logical(1)
+        ))
         non_normal_percent <- non_normal_count / length(data_quality_metrics$normality_tests) * 100
       }
       
       if (non_normal_percent > 50) {
         recommendations$normality <- list(
-          title = "Non-Normal Data Distribution",
-          recommendation = "Use rank-based correlation methods",
-          details = paste0(round(non_normal_percent), "% of regions show non-normal distributions. Spearman correlation is recommended."),
-          rationale = "Non-parametric methods are more robust to violations of normality assumptions and outliers.",
+          title = "Non‑Normal Data Distribution",
+          recommendation = "Use Spearman rank correlation",
+          details = sprintf("%.0f%% of brain regions show non‑normal distributions. Spearman correlation is strongly recommended.",
+                            non_normal_percent),
+          rationale = paste0(
+            "A high proportion (", round(non_normal_percent), "%) of your brain regions exhibit non‑normal distributions. ",
+            "Non‑normal data violates a key assumption of Pearson correlation, potentially leading to biased estimates and unreliable p‑values. ",
+            "Spearman rank correlation is distribution‑free and makes no assumptions about normality. ",
+            "In neuroscience data, non‑normality often arises from measurement constraints, biological thresholds, or small sample sizes. ",
+            "Recent methodological studies show that Spearman correlation provides more consistent results across studies ",
+            "when data exhibits non‑normal properties, which is common in functional brain connectivity analyses."),
           suggested_values = list(
             correlation_method = "spearman",
-            use_robust = TRUE
+            use_robust         = FALSE
           )
         )
+        
       } else if (non_normal_percent > 20) {
         recommendations$normality <- list(
           title = "Mixed Distribution Patterns",
-          recommendation = "Consider robust correlation methods",
-          details = paste0(round(non_normal_percent), "% of regions show non-normal distributions. Both Pearson and Spearman are viable."),
-          rationale = "Mixed distribution patterns suggest heterogeneity that robust methods can handle better.",
+          recommendation = "Consider Spearman correlation method",
+          details = sprintf("%.0f%% of brain regions show non‑normal distributions. Both Pearson and Spearman are viable, but Spearman offers better robustness.",
+                            non_normal_percent),
+          rationale = paste0(
+            "Your data shows mixed distribution patterns, with ", round(non_normal_percent), "% of brain regions exhibiting non‑normal distributions. ",
+            "This level of non‑normality may impact some connections but not others. Spearman correlation offers a good compromise, ",
+            "as it works well with both normal and non‑normal distributions. While Pearson correlation has slightly higher statistical power ",
+            "when normality assumptions are perfectly met, this advantage diminishes with even modest departures from normality. ",
+            "In preclinical neuroscience, data often exhibits some degree of non‑normality due to biological variation, measurement constraints, ",
+            "or small‑to‑moderate sample sizes. The rank‑based approach of Spearman provides consistent results across different distribution shapes."),
           suggested_values = list(
             correlation_method = "spearman",
-            use_robust = FALSE
+            use_robust         = FALSE
           )
         )
       }
       
-      # Outlier based recommendations
-      outlier_percent <- (data_quality_metrics$outliers_count / (n * n_regions)) * 100
-      
-      if (data_quality_metrics$outliers_count > (n * 0.1)) {
-        recommendations$outliers <- list(
-          title = "Outlier Management",
-          recommendation = "Use robust correlation methods",
-          details = paste0("Detected ", data_quality_metrics$outliers_count, " outliers (", round(outlier_percent, 1), "% of data points)."),
-          rationale = "Outliers can dramatically affect correlation estimates. Robust methods minimize their influence.",
-          suggested_values = list(
-            use_robust = TRUE,
-            correlation_method = "spearman"
+      # ---------------------------------------------------------------------------
+      # === OUTLIER RECOMMENDATIONS ==============================================
+      # ---------------------------------------------------------------------------
+      if (!is.null(data_quality_metrics$outliers_count) && !is.null(effective_sample_size) && n_regions > 0) {
+        outlier_percent <- (data_quality_metrics$outliers_count / (effective_sample_size * n_regions)) * 100
+        
+        if (data_quality_metrics$outliers_count > (effective_sample_size * 0.1)) {
+          recommendations$outliers <- list(
+            title = "Outlier Management",
+            recommendation = "Use Spearman correlation methods",
+            details = sprintf("Detected %d outliers (%.1f%% of data points).",
+                              data_quality_metrics$outliers_count, outlier_percent),
+            rationale = paste0(
+              "Your data contains a substantial number of outliers (", round(outlier_percent, 1), "% of data points). ",
+              "In functional connectivity analysis, outliers can significantly distort correlation estimates, especially with Pearson correlation. ",
+              "Outliers in preclinical data may represent true biological variation rather than measurement errors, making their removal potentially problematic. ",
+              "Spearman correlation, being based on ranks rather than raw values, substantially reduces outlier influence while preserving the overall relationship structure. ",
+              "With your level of outliers (", data_quality_metrics$outliers_count, " points), the reliability of standard Pearson correlation would be compromised. ",
+              "Recent neuroscience literature increasingly recognises the value of rank‑based methods in handling the biological variability inherent in brain‑activity measures."),
+            suggested_values = list(
+              use_robust         = FALSE,
+              correlation_method = "spearman"
+            )
           )
-        )
+        }
       }
       
-      # Statistical testing recommendations
+      # ---------------------------------------------------------------------------
+      # === MULTIPLE‑COMPARISON RECOMMENDATIONS ==================================
+      # ---------------------------------------------------------------------------
       n_comparisons <- (n_regions * (n_regions - 1)) / 2
-      
       if (n_comparisons > 100) {
+        
+        p_thresh_rec <- if (n_comparisons > 300) 0.01 else 0.05
+        comparison_message <- if (n_comparisons > 300)
+          "Given the very high number of comparisons (>300), a stricter significance threshold (p<0.01) is recommended even with FDR correction to ensure network reliability."
+        else
+          "The recommended p<0.05 threshold with FDR correction balances sensitivity and specificity for your moderate number of comparisons."
+        
         recommendations$multiple_testing <- list(
           title = "Multiple Comparisons Correction",
           recommendation = "Apply FDR correction and consider stricter thresholds",
-          details = paste0("With ", n_comparisons, " pairwise comparisons, multiple testing correction is essential."),
-          rationale = "Many statistical tests increase the probability of false discoveries. FDR correction controls this risk.",
+          details = sprintf("With %d pairwise comparisons, multiple testing correction is essential.", n_comparisons),
+          rationale = paste0(
+            "Your analysis involves ", n_comparisons, " pairwise comparisons between brain regions. Without correction, the risk of false positives increases dramatically. ",
+            "At a standard α=0.05, you would expect approximately ", round(n_comparisons * 0.05), " false‑positive connections by chance alone. ",
+            "False Discovery Rate (FDR) correction offers an excellent balance between Type I error control and statistical power for network analyses. ",
+            "Unlike stricter Bonferroni correction, FDR maintains sensitivity while controlling the proportion of false positives among discovered connections. ",
+            comparison_message),
           suggested_values = list(
-            perform_significance = TRUE,
-            apply_fdr = TRUE,
-            significance_threshold = if (n_comparisons > 300) 0.01 else 0.05
+            perform_significance     = TRUE,
+            apply_fdr               = TRUE,
+            significance_threshold  = p_thresh_rec
           )
         )
       }
       
-      # Data quality specific recommendations
-      if (data_quality_metrics$missing_percent > 5) {
+      # ---------------------------------------------------------------------------
+      # === MISSING‑DATA RECOMMENDATIONS ==========================================
+      # ---------------------------------------------------------------------------
+      if (!is.null(data_quality_metrics$missing_percent) && data_quality_metrics$missing_percent > 5) {
         recommendations$missing_data <- list(
           title = "Missing Data Handling",
-          recommendation = "Enable data imputation and consider robust methods",
-          details = paste0("Missing data: ", round(data_quality_metrics$missing_percent, 1), "% of values."),
-          rationale = "Missing data can bias correlation estimates. Imputation with robust methods minimizes this bias.",
+          recommendation = "Enable data imputation",
+          details = sprintf("Missing data: %.1f%% of values.", data_quality_metrics$missing_percent),
+          rationale = paste0(
+            "Your dataset contains ", round(data_quality_metrics$missing_percent, 1), "% missing values. ",
+            "In connectivity analysis, missing data can introduce bias, particularly for brain regions with systematic patterns of missingness. ",
+            "Mean imputation preserves the overall connectivity structure while allowing all regions to be included in the analysis. ",
+            "While more sophisticated imputation methods exist (e.g., multiple imputation), mean imputation provides a good balance of simplicity and effectiveness for connectivity analyses. ",
+            "Research in neuroimaging suggests that with moderate amounts of missing data (<10%), mean imputation produces reliable network‑topology metrics. ",
+            "The alternative—excluding regions or subjects with missing data—would reduce statistical power and potentially introduce selection bias. ",
+            "Mean imputation is particularly appropriate for functional connectivity where relative patterns between regions are more important than absolute values."),
           suggested_values = list(
             impute_missing = TRUE,
-            use_robust = TRUE
+            use_robust     = FALSE
           )
         )
       }
       
       return(recommendations)
     }
+    
     
     # Initial message based on data state
     output$initial_message <- shiny::renderUI({
