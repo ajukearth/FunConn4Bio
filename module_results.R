@@ -435,7 +435,7 @@ results <- function(id, data_import_results, preferences_results) {
     # Create reactive values for this module
     rv <- shiny::reactiveValues(
       analysis_complete = FALSE,
-      current_plot = NULL,
+      current_plot = NULL,          # Will store actual ggplot object now, not recordPlot
       networks = NULL,
       global_metrics = NULL,
       node_metrics = NULL,
@@ -599,7 +599,6 @@ results <- function(id, data_import_results, preferences_results) {
         shiny::removeNotification(progress_id)
       })
       
-      # Get the data and preferences
       prefs <- shiny::isolate(preferences_results())
       data_info <- shiny::isolate(data_import_results())
       
@@ -620,21 +619,30 @@ results <- function(id, data_import_results, preferences_results) {
       rv$distance_matrix[lower.tri(rv$distance_matrix)] <- t(rv$distance_matrix)[lower.tri(rv$distance_matrix)]
       diag(rv$distance_matrix) <- 0
       
+      # Add parameter validation before calling run_network_analysis_by_group
+      # Extract parameters with validation
+      correlation_threshold <- if (is.list(prefs$correlation_threshold)) 0.3 else prefs$correlation_threshold
+      correlation_method <- if (is.list(prefs$correlation_method)) "pearson" else prefs$correlation_method
+      correlation_type <- if (is.list(prefs$correlation_type)) "standard" else prefs$correlation_type
+      use_robust <- if (is.list(prefs$use_robust)) FALSE else prefs$use_robust
+      use_regularization <- if (is.list(prefs$use_regularization)) TRUE else prefs$use_regularization
+      perform_significance <- if (is.list(prefs$perform_significance)) TRUE else prefs$perform_significance
+      apply_fdr <- if (is.list(prefs$apply_fdr)) TRUE else prefs$apply_fdr
+      
       # Run enhanced network analysis
       tryCatch({
-        # Perform the actual analysis
-        # This would call to the utility functions in utils.R
+        # Perform the actual analysis with validated parameters
         network_results <- run_network_analysis_by_group(
           data = analysis_data,
           region_columns = prefs$selected_regions,
           group_column = "Group",
-          correlation_threshold = prefs$correlation_threshold,
-          correlation_method = prefs$correlation_method,
-          correlation_type = prefs$correlation_type,
-          use_robust = prefs$use_robust,
-          use_regularization = prefs$use_regularization,
-          perform_significance = prefs$perform_significance,
-          apply_fdr = prefs$apply_fdr
+          correlation_threshold = correlation_threshold,
+          correlation_method = correlation_method, 
+          correlation_type = correlation_type,
+          use_robust = use_robust,
+          use_regularization = use_regularization,
+          perform_significance = perform_significance,
+          apply_fdr = apply_fdr
         )
         
         # Store results
@@ -824,8 +832,8 @@ results <- function(id, data_import_results, preferences_results) {
                             render_default_plot()
       )
       
-      # Store current plot for download
-      rv$current_plot <- recordPlot()
+      # FIXED: Store the actual ggplot object instead of using recordPlot()
+      rv$current_plot <- plot_result
       
       return(plot_result)
     })
@@ -1451,7 +1459,7 @@ results <- function(id, data_import_results, preferences_results) {
         ggplot2::theme_void()
     }
     
-    # Download current plot
+    # Download current plot - FIXED to use ggsave for ggplot2 objects
     output$download_current_plot <- shiny::downloadHandler(
       filename = function() {
         # Create filename based on current settings
@@ -1473,19 +1481,19 @@ results <- function(id, data_import_results, preferences_results) {
       },
       
       content = function(file) {
-        # Save current plot
-        png(file, width = 800, height = 600, res = 100)
+        # FIXED: Save the ggplot object directly using ggsave
         if (!is.null(rv$current_plot)) {
-          replayPlot(rv$current_plot)
+          save_plot_safely(rv$current_plot, file, width = 8, height = 6)
         } else {
           # Fallback if no plot is stored
+          png(file, width = 800, height = 600, res = 100)
           plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "", main = "No plot available")
+          dev.off()
         }
-        dev.off()
       }
     )
     
-    # Download all results
+    # Download all results - FIXED to use ggsave for ggplot2 objects
     output$download_all_results <- shiny::downloadHandler(
       filename = function() {
         paste0("brain_network_analysis_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".zip")
@@ -1605,31 +1613,24 @@ results <- function(id, data_import_results, preferences_results) {
           write.csv(rv$node_metrics, node_file, row.names = FALSE)
         }
         
-        # Generate plots for each group
+        # Generate plots for each group - FIXED to use ggsave
         if (!is.null(rv$networks)) {
           for (group_name in names(rv$networks)) {
             # Network plot
             network_file <- file.path(plots_dir, paste0("network_", 
                                                         gsub("[^a-zA-Z0-9]", "_", group_name), ".png"))
             
-            png(network_file, width = 800, height = 600, res = 100)
-            
-            # Temporarily change inputs to generate plots for each group
-            old_selected_group <- input$selected_group
-            old_display_type <- input$display_type
-            
-            # Generate network plot
+            # FIXED: Use local environment to generate plot and save directly with ggsave
             local({
               # Create a local environment to avoid modifying inputs
               selected_group <- group_name
-              display_type <- "network"
               
               # Create simple network plot
               network <- rv$networks[[selected_group]]
               
               if (!is.null(network) && !is.null(network$graph)) {
                 # Basic network plot for each group
-                plot_network(
+                p <- plot_network(
                   network$graph,
                   node_metrics = rv$node_metrics[rv$node_metrics$Group == selected_group, ],
                   color_by = "brain_area",
@@ -1641,20 +1642,26 @@ results <- function(id, data_import_results, preferences_results) {
                   show_edge_labels = FALSE,
                   show_node_labels = TRUE
                 )
+                
+                # FIXED: Use save_plot_safely instead of png device
+                save_plot_safely(p, network_file, width = 8, height = 6, dpi = 100)
               } else {
-                plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "", 
-                     main = paste("No network available for", selected_group))
+                # Create a simple message plot for no network
+                p <- ggplot2::ggplot() + 
+                  ggplot2::annotate("text", x = 0, y = 0, 
+                                    label = paste("No network available for", selected_group)) +
+                  ggplot2::theme_void() +
+                  ggplot2::labs(title = paste("Network Graph:", selected_group))
+                
+                save_plot_safely(p, network_file, width = 8, height = 6, dpi = 100)
               }
             })
-            
-            dev.off()
             
             # Heatmap plot
             heatmap_file <- file.path(plots_dir, paste0("heatmap_", 
                                                         gsub("[^a-zA-Z0-9]", "_", group_name), ".png"))
             
-            png(heatmap_file, width = 800, height = 600, res = 100)
-            
+            # FIXED: Use local environment to generate plot and save directly with ggsave
             local({
               # Create a local environment to avoid modifying inputs
               selected_group <- group_name
@@ -1670,46 +1677,72 @@ results <- function(id, data_import_results, preferences_results) {
                 hc <- stats::hclust(dist_matrix, method = "complete")
                 correlation_matrix <- correlation_matrix[hc$order, hc$order]
                 
-                # Simple heatmap 
-                image(1:ncol(correlation_matrix), 1:nrow(correlation_matrix), correlation_matrix,
-                      col = colorRampPalette(c("blue", "white", "red"))(200),
-                      xlab = "", ylab = "",
-                      axes = FALSE,
-                      main = paste("Correlation Heatmap:", selected_group))
+                # Convert to long format for ggplot
+                melted_corr <- reshape2::melt(correlation_matrix)
                 
-                axis(1, at = 1:ncol(correlation_matrix), labels = colnames(correlation_matrix), 
-                     las = 2, cex.axis = 0.7)
-                axis(2, at = 1:nrow(correlation_matrix), labels = rownames(correlation_matrix), 
-                     las = 2, cex.axis = 0.7)
+                # Create enhanced heatmap with ggplot2
+                p <- ggplot2::ggplot(melted_corr, ggplot2::aes(x = Var1, y = Var2, fill = value)) +
+                  ggplot2::geom_tile(color = "white", size = 0.1) +
+                  ggplot2::scale_fill_gradient2(
+                    low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0, 
+                    limits = c(-1, 1), name = "Correlation"
+                  ) +
+                  ggplot2::theme_minimal() +
+                  ggplot2::theme(
+                    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = 8),
+                    axis.text.y = ggplot2::element_text(size = 8),
+                    plot.title = ggplot2::element_text(hjust = 0.5, size = 14)
+                  ) +
+                  ggplot2::labs(
+                    title = paste("Correlation Heatmap:", selected_group),
+                    x = "", y = ""
+                  ) +
+                  ggplot2::coord_fixed()
+                
+                # FIXED: Use save_plot_safely instead of png device
+                save_plot_safely(p, heatmap_file, width = 8, height = 6, dpi = 100)
               } else {
-                plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "", 
-                     main = paste("No correlation data available for", selected_group))
+                # Create a simple message plot for no correlation data
+                p <- ggplot2::ggplot() + 
+                  ggplot2::annotate("text", x = 0, y = 0, 
+                                    label = paste("No correlation data available for", selected_group)) +
+                  ggplot2::theme_void() +
+                  ggplot2::labs(title = paste("Correlation Heatmap:", selected_group))
+                
+                save_plot_safely(p, heatmap_file, width = 8, height = 6, dpi = 100)
               }
             })
-            
-            dev.off()
           }
         }
         
-        # Save global metrics plot
+        # Save global metrics plot - FIXED to use ggsave
         if (!is.null(rv$global_metrics)) {
           global_file <- file.path(plots_dir, "global_metrics.png")
           
-          png(global_file, width = 800, height = 600, res = 100)
-          
-          # Simple barplot of network density
-          density_data <- rv$global_metrics[rv$global_metrics$Metric == "Density", ]
-          
-          if (nrow(density_data) > 0) {
-            barplot(density_data$Value, names.arg = density_data$Group,
-                    col = "lightblue", main = "Network Density Comparison",
-                    ylab = "Density", xlab = "Group")
-          } else {
-            plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "", 
-                 main = "No global metrics available")
-          }
-          
-          dev.off()
+          # FIXED: Generate plot and save directly with ggsave
+          local({
+            # Simple barplot of network density
+            density_data <- rv$global_metrics[rv$global_metrics$Metric == "Density", ]
+            
+            if (nrow(density_data) > 0) {
+              p <- ggplot2::ggplot(density_data, ggplot2::aes(x = Group, y = Value)) +
+                ggplot2::geom_col(fill = "lightblue") +
+                ggplot2::theme_minimal() +
+                ggplot2::labs(
+                  title = "Network Density Comparison",
+                  y = "Density", x = "Group"
+                )
+              
+              save_plot_safely(p, global_file, width = 8, height = 6, dpi = 100)
+            } else {
+              p <- ggplot2::ggplot() + 
+                ggplot2::annotate("text", x = 0, y = 0, label = "No global metrics available") +
+                ggplot2::theme_void() +
+                ggplot2::labs(title = "Global Network Metrics")
+              
+              save_plot_safely(p, global_file, width = 8, height = 6, dpi = 100)
+            }
+          })
         }
         
         # Create the zip file
